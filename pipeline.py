@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import math
 import gzip
 import shutil
@@ -30,16 +31,19 @@ def check(structure, args):
             return 4
         if not res.internal_coord.is20AA:   # non-standard aa
             return 4
-        if idx < (len(residues)-1) and \
-            res.internal_coord.get_length("C:1N") > args.max_peptide_bond:
-            return 4
+        if idx < (len(residues)-1):
+            peptide_bond = res.internal_coord.get_length("C:1N")
+            if (peptide_bond is None) or \
+                (peptide_bond > args.max_peptide_bond) or \
+                    (peptide_bond < args.min_peptide_bond):
+                return 4
     return 0
 
 
 def filter_func(pid, gzipfps, args):
     parser = FastMMCIFParser()
-    valid = []
 
+    valid = 0
     too_long = 0
     too_short = 0
     lower_plddt = 0
@@ -52,7 +56,8 @@ def filter_func(pid, gzipfps, args):
 
         code = check(structure, args)
         if code == 0:
-            valid.append(fp)
+            valid += 1
+            shutil.move(fp, os.path.join(args.result_dir, os.path.basename(fp)))
         elif code == 1:
             too_long += 1
         elif code == 2:
@@ -64,7 +69,7 @@ def filter_func(pid, gzipfps, args):
         else:
             raise ValueError(f"Unvalid check code: {code}")
 
-    return valid, (too_long, too_short, lower_plddt, bad_res)
+    return [valid, too_long, too_short, lower_plddt, bad_res]
         
 
 def unzip_fun(pid, tar_fp, tmp_dir):
@@ -82,58 +87,67 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--af_dir", type=str)
     parser.add_argument("--tmp_dir", type=str, default="/lustre/Data/tmp_cif")
+    parser.add_argument("--result_dir", type=str, default="/lustre/home/yangsen/database/AlphaFold_filtered")
     parser.add_argument("--log", type=str, default="./log.txt")
-    parser.add_argument("--processes", type=int, default=128) 
+    parser.add_argument("--processes", type=int) 
 
-    parser.add_argument("--plddt", type=float, default=60)
-    parser.add_argument("--min_len", type=int, default=50)
-    parser.add_argument("--max_len", type=int, default=512)
-    parser.add_argument("--max_peptide_bond", type=float, default=1.4)
+    parser.add_argument("--plddt", type=float)
+    parser.add_argument("--min_len", type=int)
+    parser.add_argument("--max_len", type=int)
+    parser.add_argument("--min_peptide_bond", type=float)
+    parser.add_argument("--max_peptide_bond", type=float)
     args = parser.parse_args()
 
     logger_handler = open(args.log, "w")
+    logger_handler.write("CIF\tRatio\tValid\tLong\tShort\tPLDDT\tRES\tExtract\tFilter\n")
 
-    unzip_pool = Pool(processes=args.processes)
-    filter_pool = Pool(processes=args.processes)    
     species_tars = os.listdir(args.af_dir)
    
+    if os.path.exists(args.result_dir):
+        shutil.rmtree(args.result_dir)
+    os.makedirs(args.result_dir, exist_ok=True)
+
     tar_idx = -1
     while True:
-        # # clear tmp directory
-        # tmp_cif_num = 0
-        # shutil.rmtree(args.tmp_dir)
-        # os.makedirs(args.tmp_dir)
+        start_time = time.time()
+        # clear tmp directory
+        tmp_cif_num = 0
+        shutil.rmtree(args.tmp_dir)
+        os.makedirs(args.tmp_dir)
 
-        # # unzip 
-        # while True:
-        #     unzip_results = []
-        #     for pid in range(args.processes):
-        #         tar_idx = tar_idx + 1
-        #         if tar_idx >= len(species_tars):
-        #             break
-        #         unzip_results.append(unzip_pool.apply_async(
-        #             unzip_fun,
-        #             args=(pid, 
-        #                   os.path.join(args.af_dir, species_tars[tar_idx]),
-        #                   args.tmp_dir),
-        #             error_callback=error_callback))
+        # unzip 
+        while True:
+            unzip_pool = Pool(processes=args.processes)
+            unzip_results = []
+            for pid in range(args.processes):
+                tar_idx = tar_idx + 1
+                if tar_idx >= len(species_tars):
+                    break
+                unzip_results.append(unzip_pool.apply_async(
+                    unzip_fun,
+                    args=(pid, 
+                          os.path.join(args.af_dir, species_tars[tar_idx]),
+                          args.tmp_dir),
+                    error_callback=error_callback))
                 
-        #     unzip_pool.close()
-        #     unzip_pool.join()
+            unzip_pool.close()
+            unzip_pool.join()
 
-        #     tmp_cif_num += sum([r.get() for r in unzip_results])
-        #     if (tmp_cif_num > args.processes * 100) or (tar_idx >= len(species_tars)):
-        #         break
-        tmp_cif_num = 5057
+            tmp_cif_num += sum([r.get() for r in unzip_results])
+            if (tmp_cif_num > args.processes * 100) or (tar_idx >= len(species_tars)):
+                break
+        extract_time = time.time()
 
         # filter
+        filter_pool = Pool(processes=args.processes)
         gzipfps = [os.path.join(args.tmp_dir, fn) for fn in os.listdir(args.tmp_dir)]
         assert len(gzipfps) == tmp_cif_num
         batch = math.ceil(tmp_cif_num / args.processes)
-        filter_results = []
+
+        results = []
         for pid in range(args.processes):
             l, r = pid * batch, min((pid+1) * batch, tmp_cif_num)
-            filter_results.append(filter_pool.apply_async(
+            results.append(filter_pool.apply_async(
                 filter_func,
                 args=(pid,
                       gzipfps[l: r],
@@ -141,6 +155,29 @@ if __name__ == '__main__':
                 error_callback=error_callback))
         filter_pool.close()
         filter_pool.join()
+        filter_time = time.time()
 
-        break
+        _tot = 0
+        tot_valid, tot_long, tot_short, tot_plddt, tot_res = 0, 0, 0, 0, 0
+        for idx in range(len(results)):
+            _result = results[idx].get()
+            _tot += sum(_result)
+
+            tot_valid += _result[0]
+            tot_long += _result[1]
+            tot_short += _result[2]
+            tot_plddt += _result[3]
+            tot_res += _result[4]
+        assert _tot == tmp_cif_num
+        logger_handler.write(
+            f"{tmp_cif_num}\t{round(tot_valid/tmp_cif_num*100, 2)}%" + 
+            f"\t{tot_valid}\t{tot_long}\t{tot_short}\t{tot_plddt}\t{tot_res}" +
+            f"\t{round((extract_time-start_time)/60, 2)}" +
+            f"\t{round((filter_time-extract_time)/60, 2)}\n")
+        logger_handler.flush()
+
+        if tar_idx >= len(species_tars):
+            break
+
+    logger_handler.close()
 
